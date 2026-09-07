@@ -74,10 +74,10 @@ function AuthPanel({ client, configured }) {
 
         <div className="auth-intro">
           <p className="eyebrow">Philippine legal information</p>
-          <h1 id="product-title">Philippine Digital Law AI Assistant</h1>
+          <h1 id="product-title">Philippine Data Privacy AI Assistant</h1>
           <p>
-            Research Philippine privacy, cybercrime, electronic-commerce,
-            archives, ICT, digital-government, and online child-protection laws.
+            Research Philippine data privacy, personal data protection,
+            and National Privacy Commission guidance.
           </p>
         </div>
 

@@ -9,6 +9,7 @@ from app.services.auth import get_current_user
 from app.services.gemini import GeminiService
 from app.services.retrieval import RetrievalService
 from app.services.supabase import SupabaseService
+from app.services.evidence import UNABLE_TO_VERIFY, PDF_UNABLE_TO_VERIFY, is_privacy_pdf_question
 
 
 logger = logging.getLogger(__name__)
@@ -46,8 +47,8 @@ async def chat(
 
     if scope == ScopeClassification.OUT_OF_SCOPE:
         answer = (
-             "I can't answer questions "
-            "outside these supported Philippine digital laws."
+            "I specialize in Philippine data privacy and data protection. "
+            "Please ask about personal data, the Data Privacy Act, or NPC guidance."
         )
         message_id = await _save_message_safely(
             supabase, request.conversation_id, user.id, answer, []
@@ -60,10 +61,7 @@ async def chat(
     if result.answer:
         answer = result.answer
     elif not result.context:
-        answer = (
-            "I couldn't find sufficient information in the available official Philippine "
-            "legal sources to answer this confidently."
-        )
+        answer = UNABLE_TO_VERIFY
     else:
         try:
             answer = await gemini.answer(request.message, result.context, result.sources)
@@ -73,6 +71,11 @@ async def chat(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="The AI service could not generate an answer right now.",
             ) from exc
+
+    if answer == UNABLE_TO_VERIFY and is_privacy_pdf_question(request.message):
+        answer = PDF_UNABLE_TO_VERIFY
+    if answer in (UNABLE_TO_VERIFY, PDF_UNABLE_TO_VERIFY):
+        result.sources = []
 
     message_id = await _save_message_safely(
         supabase,
@@ -97,7 +100,10 @@ async def _classify_scope_safely(
         return await gemini.classify_scope(message)
     except Exception as exc:
         logger.warning("Gemini classification failed: %s", type(exc).__name__)
-        return ScopeClassification.DIGITAL_LAW_RELATED
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The AI service could not classify this question right now. Please retry shortly.",
+        ) from exc
 
 
 async def _save_message_safely(

@@ -2,307 +2,180 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import app.services.retrieval as retrieval_module
+from app.core.config import Settings
 from app.schemas.chat import Source
-from app.services.retrieval import OfficialLegalSource, RetrievalService
+from app.services.evidence import RelevanceAssessment, UNABLE_TO_VERIFY
+from app.services.retrieval import RetrievalResult, RetrievalService
 
 
-class RetrievalSelectionTests(unittest.TestCase):
-    def test_keeps_complete_section_for_data_subject_rights(self) -> None:
-        source = """
-SEC. 15.
-Extension of Privileged Communication.
-Evidence gathered on privileged information is inadmissible.
-SEC. 16.
-Rights of the Data Subject.
-The data subject is entitled to:
-(a) Be informed whether personal information has been processed;
-(b) Be furnished information about the processing;
-(c) Have reasonable access to processed personal information;
-(d) Dispute inaccuracies and have them corrected;
-(e) Suspend, withdraw, block, remove, or destroy personal information; and
-(f) Be indemnified for damages.
-SEC. 17.
-Transmissibility of Rights of the Data Subject.
-Lawful heirs and assigns may invoke these rights.
-""".strip()
+def assessment(sufficient=False, relevant=(), current=False):
+    return RelevanceAssessment(
+        is_sufficient=sufficient, relevant_sources=list(relevant),
+        requires_current_web=current, reason="Test evidence assessment",
+    )
 
-        result = RetrievalService._select_relevant_passages(
-            "What rights do data subjects have under RA 10173?",
-            source,
+
+def chunk(**overrides):
+    return dict(
+        document_id="00000000-0000-0000-0000-000000000001",
+        source_title="Uploaded privacy PDF", content="SEC. 16. Data subject rights.",
+        similarity=0.92, is_authoritative=True, page_number=4, section="Section 16",
+        source_url=None, publication_date="2020-01-01", **overrides,
+    )
+
+
+class HybridRetrievalTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.settings = Settings(_env_file=None, gemini_api_key="test",
+                                 supabase_url="https://example.supabase.co",
+                                 supabase_secret_key="test")
+        self.gemini = SimpleNamespace(
+            embed_question=AsyncMock(return_value=[0.1]),
+            evaluate_relevance=AsyncMock(return_value=assessment()),
+            search_official_web=AsyncMock(return_value=("", [])),
         )
+        self.supabase = SimpleNamespace(match_document_chunks=AsyncMock(return_value=[chunk()]))
+        self.service = RetrievalService(self.settings, self.gemini, self.supabase)
+        self.service._knowledge_base_is_ready = AsyncMock(return_value=True)
+        self.service._direct_privacy_evidence = AsyncMock(return_value=RetrievalResult("", []))
 
-        self.assertIn("SEC. 16.", result)
-        self.assertIn("(a) Be informed", result)
-        self.assertIn("(f) Be indemnified", result)
+    def web(self, text="Official NPC guidance.", url="https://privacy.gov.ph/guidance/"):
+        return (f"[Source 1: Web Source - NPC guidance]\n{text}",
+                [Source(title="NPC guidance", url=url, origin="web")])
 
-    def test_selects_relevant_article_from_article_based_law(self) -> None:
-        source = """
-ARTICLE 1. Short Title.
-This Act shall be known by its short title.
-ARTICLE 2. General Policy.
-The State shall protect consumers from deceptive sales practices.
-ARTICLE 3. Definitions.
-Consumer means a natural person who purchases goods or services.
-ARTICLE 4. Consumer Records.
-A provider shall handle consumer records and personal information fairly.
-ARTICLE 5. Penalties.
-The applicable penalties are provided here.
-""".strip()
+    async def test_sufficient_pdf_never_searches_web(self):
+        self.gemini.evaluate_relevance.return_value = assessment(True, [1])
+        result = await self.service.retrieve("What rights do data subjects have?")
+        self.gemini.embed_question.assert_awaited_once()
+        self.supabase.match_document_chunks.assert_awaited_once()
+        self.gemini.search_official_web.assert_not_awaited()
+        self.assertEqual(result.sources[0].origin, "knowledge_base")
+        self.assertIsNone(result.sources[0].url)
+        self.assertEqual(result.sources[0].page, 4)
+        self.assertIn("Section 16", result.sources[0].section)
 
-        result = RetrievalService._select_relevant_passages(
-            "How does the law protect consumer personal information?",
-            source,
-        )
+    async def test_high_similarity_unrelated_rights_do_not_answer_penalties(self):
+        self.gemini.evaluate_relevance.side_effect = [assessment(), assessment(True, [1])]
+        self.gemini.search_official_web.return_value = self.web("Penalty provision.")
+        result = await self.service.retrieve("What penalties apply to mishandling personal information?")
+        self.gemini.search_official_web.assert_awaited_once_with(
+            "What penalties apply to mishandling personal information?", tier=1)
+        self.assertEqual([s.origin for s in result.sources], ["web"])
+        self.assertNotIn("Data subject rights", result.context)
 
-        self.assertIn("ARTICLE 4. Consumer Records.", result)
-        self.assertIn("personal information fairly", result)
+    async def test_empty_database_uses_npc_first_without_embedding(self):
+        self.service._knowledge_base_is_ready.return_value = False
+        self.gemini.evaluate_relevance.return_value = assessment(True, [1])
+        self.gemini.search_official_web.return_value = self.web()
+        result = await self.service.retrieve("Can an employer collect fingerprints?")
+        self.gemini.embed_question.assert_not_awaited()
+        self.assertEqual(result.sources[0].origin, "web")
+        self.gemini.search_official_web.assert_awaited_once_with(
+            "Can an employer collect fingerprints?", tier=1)
 
+    async def test_current_question_retrieves_vectors_before_web_and_fuses(self):
+        events = []
+        async def embed(question):
+            events.append("vector")
+            return [0.1]
+        async def search(question, tier=1):
+            events.append("web")
+            return self.web("Newer NPC guidance differs from the uploaded PDF.")
+        self.gemini.embed_question.side_effect = embed
+        self.gemini.search_official_web.side_effect = search
+        self.gemini.evaluate_relevance.side_effect = [
+            assessment(True, [1]), assessment(True, [1, 2], True)]
+        result = await self.service.retrieve("What is the latest NPC guidance on data subject rights?")
+        self.assertEqual(events, ["vector", "web"])
+        self.assertEqual([s.origin for s in result.sources], ["knowledge_base", "web"])
+        self.assertIn("[Source 1:", result.context)
+        self.assertIn("[Source 2:", result.context)
+        self.assertIsNone(result.answer)
 
-class RetrievalOptimizationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_latest_npc_circular_does_not_require_gemini(self) -> None:
-        retrieval_module._knowledge_base_cache = None
-        settings = SimpleNamespace(
-            web_search_enabled=True,
-            npc_issuances_url=(
-                "https://privacy.gov.ph/pips-and-pics/advisories-circulars/"
-            ),
-            judiciary_ra_10173_url="https://example.com/ra-10173",
-            judiciary_ra_10175_url="https://example.com/ra-10175",
-            judiciary_ra_8792_url="https://example.com/ra-8792",
-            judiciary_ra_9470_url="https://example.com/ra-9470",
-            judiciary_ra_10844_url="https://example.com/ra-10844",
-            judiciary_ra_11032_url="https://example.com/ra-11032",
-            judiciary_ra_11930_url="https://example.com/ra-11930",
-        )
-        gemini = SimpleNamespace(
-            search_official_web=AsyncMock(),
-            embed_question=AsyncMock(),
-        )
-        supabase = SimpleNamespace(has_ready_documents=AsyncMock())
-        service = RetrievalService(settings, gemini, supabase)
-        service._get_official_source_text = AsyncMock(return_value="""
-# CIRCULARS
-* **NPC Circular No. 2024-02 -**[CCTV Systems](https://privacy.gov.ph/wp-content/uploads/2024/08/cctv.pdf)
-* **NPC Circular No. 2025-01 -**[Guidelines on Body-Worn Cameras](https://privacy.gov.ph/wp-content/uploads/2025/05/bwc.pdf)
-""".strip())
+    async def test_semantic_recency_check_triggers_web_without_keyword(self):
+        self.gemini.evaluate_relevance.side_effect = [
+            assessment(True, [1], True), assessment(True, [1, 2], True)]
+        self.gemini.search_official_web.return_value = self.web()
+        await self.service.retrieve("Must my company register its DPO?")
+        self.gemini.search_official_web.assert_awaited_once()
 
-        result = await service.retrieve(
-            "What's the latest NPC circular released by the National Privacy Commission?"
-        )
+    async def test_partial_pdf_and_web_jointly_answer_question(self):
+        self.gemini.evaluate_relevance.side_effect = [
+            assessment(False, [1]), assessment(True, [1, 2])]
+        self.gemini.search_official_web.return_value = self.web()
+        result = await self.service.retrieve("Explain privacy rights and biometric processing.")
+        self.assertEqual(len(result.sources), 2)
 
-        gemini.search_official_web.assert_not_awaited()
-        gemini.embed_question.assert_not_awaited()
-        supabase.has_ready_documents.assert_not_awaited()
-        self.assertIn("NPC Circular No. 2025-01", result.context)
-        self.assertIn("NPC Circular No. 2025-01", result.answer)
-        self.assertEqual(
-            str(result.sources[0].url),
-            "https://privacy.gov.ph/wp-content/uploads/2025/05/bwc.pdf",
-        )
+    async def test_expands_to_government_only_after_npc_is_insufficient(self):
+        self.supabase.match_document_chunks.return_value = []
+        self.gemini.search_official_web.side_effect = [
+            self.web("General unrelated information."),
+            self.web("Relevant legal provision.", "https://lawphil.net/statutes/law.html")]
+        self.gemini.evaluate_relevance.side_effect = [assessment(), assessment(True, [1])]
+        result = await self.service.retrieve("What penalties apply to personal data misuse?")
+        self.assertEqual([c.kwargs["tier"] for c in self.gemini.search_official_web.await_args_list], [1, 2])
+        self.assertIn("lawphil.net", str(result.sources[0].url))
+        self.assertNotIn("unrelated", result.context)
 
-    async def test_other_current_questions_use_live_official_web_search(self) -> None:
-        official_source = Source(
-            title="Official government source",
-            url="https://example.gov.ph/current-rule",
-        )
-        settings = SimpleNamespace(web_search_enabled=True)
-        gemini = SimpleNamespace(search_official_web=AsyncMock(return_value=(
-            "Current official-web notes.",
-            [official_source],
-        )))
-        service = RetrievalService(settings, gemini, SimpleNamespace())
+    async def test_web_failure_does_not_present_old_pdf_as_current(self):
+        self.gemini.evaluate_relevance.return_value = assessment(True, [1])
+        result = await self.service.retrieve("What are the latest data subject rules?")
+        self.assertEqual(result.answer, UNABLE_TO_VERIFY)
+        self.assertEqual(result.sources, [])
 
-        result = await service.retrieve(
-            "What is the latest Philippine cybercrime regulation?"
-        )
+    async def test_evaluator_failure_does_not_treat_results_as_sufficient(self):
+        self.gemini.evaluate_relevance.side_effect = RuntimeError("quota unavailable")
+        self.gemini.search_official_web.return_value = self.web()
+        result = await self.service.retrieve("What are the privacy requirements?")
+        self.assertEqual(result.answer, UNABLE_TO_VERIFY)
 
-        gemini.search_official_web.assert_awaited_once()
-        self.assertEqual(result.sources, [official_source])
+    async def test_embedding_failure_still_tries_web(self):
+        self.gemini.embed_question.side_effect = RuntimeError("embedding unavailable")
+        self.gemini.search_official_web.return_value = self.web()
+        self.gemini.evaluate_relevance.return_value = assessment(True, [1])
+        result = await self.service.retrieve("What rights do data subjects have?")
+        self.assertEqual(result.sources[0].origin, "web")
 
-    def test_latest_npc_parser_rejects_non_official_document_url(self) -> None:
-        page_text = """
-# CIRCULARS
-* **NPC Circular No. 2099-01 -**[Fake](https://example.com/fake.pdf)
-""".strip()
+    async def test_disabled_web_stops_all_external_source_fetches(self):
+        self.settings.web_search_enabled = False
+        result = await self.service.retrieve("What is the latest NPC circular?")
+        self.gemini.search_official_web.assert_not_awaited()
+        self.service._direct_privacy_evidence.assert_not_awaited()
+        self.assertEqual(result.answer, UNABLE_TO_VERIFY)
 
-        self.assertIsNone(
-            RetrievalService._parse_latest_npc_circular(page_text)
-        )
+    async def test_direct_official_fetch_must_pass_evaluation(self):
+        self.supabase.match_document_chunks.return_value = []
+        context, sources = self.web("Relevant directly fetched text.")
+        self.service._direct_privacy_evidence.return_value = RetrievalResult(context, sources)
+        self.gemini.evaluate_relevance.return_value = assessment(True, [1])
+        result = await self.service.retrieve("What rights do data subjects have?")
+        self.assertIn("directly fetched", result.context)
 
-    def test_detects_questions_that_require_current_information(self) -> None:
-        self.assertTrue(RetrievalService._requires_current_web_search(
-            "What is the latest NPC circular?"
-        ))
-        self.assertFalse(RetrievalService._requires_current_web_search(
-            "What rights do data subjects have under RA 10173?"
-        ))
+    def test_filters_untrusted_and_below_threshold_chunks(self):
+        untrusted = {**chunk(), "is_authoritative": False}
+        weak = {**chunk(), "similarity": 0.2}
+        invalid = {**chunk(), "similarity": float("nan")}
+        result = self.service._chunks_to_evidence([untrusted, weak, invalid])
+        self.assertEqual(result.sources, [])
 
-    async def test_skips_embedding_when_knowledge_base_is_empty(self) -> None:
-        retrieval_module._knowledge_base_cache = None
-        settings = SimpleNamespace(
-            retrieval_match_threshold=0.68,
-            retrieval_match_count=8,
-            judiciary_ra_10173_url=(
-                "https://elibrary.judiciary.gov.ph/thebookshelf/showdocs/2/50253"
-            ),
-            judiciary_ra_10175_url="https://example.com/ra-10175",
-            judiciary_ra_8792_url="https://example.com/ra-8792",
-            judiciary_ra_9470_url="https://example.com/ra-9470",
-            judiciary_ra_10844_url="https://example.com/ra-10844",
-            judiciary_ra_11032_url="https://example.com/ra-11032",
-            judiciary_ra_11930_url="https://example.com/ra-11930",
-        )
-        gemini = SimpleNamespace(embed_question=AsyncMock())
-        supabase = SimpleNamespace(
-            has_ready_documents=AsyncMock(return_value=False),
-        )
-        service = RetrievalService(settings, gemini, supabase)
-        service._get_official_source_text = AsyncMock(
-            return_value="SEC. 16.\nRights of the Data Subject.\n(a) Be informed."
-        )
+    def test_duplicate_chunks_keep_source_numbers_consistent(self):
+        result = self.service._chunks_to_evidence([chunk(), chunk()])
+        self.assertEqual(len(result.sources), 1)
+        self.assertEqual(result.context.count("[Source 1:"), 2)
+        self.assertNotIn("[Source 2:", result.context)
 
-        result = await service.retrieve("What rights do data subjects have?")
+    def test_different_pages_have_distinct_citations(self):
+        result = self.service._chunks_to_evidence([chunk(), {**chunk(), "page_number": 5}])
+        retained = self.service._retain_sources(result, [2])
+        self.assertEqual(retained.sources[0].page, 5)
+        self.assertIn("[Source 1:", retained.context)
+        self.assertNotIn("[Source 2:", retained.context)
 
-        supabase.has_ready_documents.assert_awaited_once()
-        gemini.embed_question.assert_not_awaited()
-        self.assertIn("SEC. 16.", result.context)
-        retrieval_module._knowledge_base_cache = None
-
-    async def test_uses_dynamic_official_source_for_unregistered_act(self) -> None:
-        retrieval_module._knowledge_base_cache = None
-        settings = SimpleNamespace(
-            retrieval_match_threshold=0.68,
-            retrieval_match_count=8,
-            judiciary_ra_10173_url="https://example.com/ra-10173",
-            judiciary_ra_10175_url="https://example.com/ra-10175",
-            judiciary_ra_8792_url="https://example.com/ra-8792",
-            judiciary_ra_9470_url="https://example.com/ra-9470",
-            judiciary_ra_10844_url="https://example.com/ra-10844",
-            judiciary_ra_11032_url="https://example.com/ra-11032",
-            judiciary_ra_11930_url="https://example.com/ra-11930",
-        )
-        gemini = SimpleNamespace(embed_question=AsyncMock())
-        supabase = SimpleNamespace(has_ready_documents=AsyncMock(return_value=False))
-        service = RetrievalService(settings, gemini, supabase)
-        dynamic_source = OfficialLegalSource(
-            source_type="RA_7394",
-            title="Republic Act No. 7394",
-            url="https://elibrary.judiciary.gov.ph/thebookshelf/showdocs/2/22263",
-            markers=(),
-        )
-        service._resolve_dynamic_source = AsyncMock(return_value=dynamic_source)
-        service._get_official_source_text = AsyncMock(
-            return_value="ARTICLE 2. Declaration of Basic Policy. Consumer protection."
-        )
-
-        result = await service.retrieve(
-            "What consumer-data protections are in RA 7394?"
-        )
-
-        service._resolve_dynamic_source.assert_awaited_once_with("7394")
-        self.assertEqual(result.sources[0].title, "Republic Act No. 7394")
-        self.assertIn("Consumer protection", result.context)
-        retrieval_module._knowledge_base_cache = None
-
-    def test_parses_only_exact_official_republic_act_result(self) -> None:
-        payload = {
-            "data": [
-                [
-                    "IRR of REPUBLIC ACT NO. 7394",
-                    "1992-01-01",
-                    "<a href='https://elibrary.judiciary.gov.ph/thebookshelf/showdocs/2/1'>IRR</a>",
-                ],
-                [
-                    "REPUBLIC ACT NO. 7394",
-                    "1992-04-13",
-                    "<a href='https://elibrary.judiciary.gov.ph/thebookshelf/showdocs/2/22263'>Consumer Act</a>",
-                ],
-            ]
-        }
-
-        source = RetrievalService._parse_dynamic_source("7394", payload)
-
-        self.assertIsNotNone(source)
-        self.assertEqual(source.source_type, "RA_7394")
-        self.assertEqual(
-            source.url,
-            "https://elibrary.judiciary.gov.ph/thebookshelf/showdocs/2/22263",
-        )
-
-    def test_rejects_non_official_dynamic_result_url(self) -> None:
-        payload = {
-            "data": [[
-                "REPUBLIC ACT NO. 7394",
-                "1992-04-13",
-                "<a href='https://example.com/fake-law'>Consumer Act</a>",
-            ]]
-        }
-
-        self.assertIsNone(RetrievalService._parse_dynamic_source("7394", payload))
-
-    def test_selects_each_supported_act_by_number(self) -> None:
-        settings = SimpleNamespace(
-            judiciary_ra_10173_url="https://example.com/ra-10173",
-            judiciary_ra_10175_url="https://example.com/ra-10175",
-            judiciary_ra_8792_url="https://example.com/ra-8792",
-            judiciary_ra_9470_url="https://example.com/ra-9470",
-            judiciary_ra_10844_url="https://example.com/ra-10844",
-            judiciary_ra_11032_url="https://example.com/ra-11032",
-            judiciary_ra_11930_url="https://example.com/ra-11930",
-        )
-        service = RetrievalService(settings, SimpleNamespace(), SimpleNamespace())
-        sources = service._official_sources()
-
-        for number in ("10173", "10175", "8792", "9470", "10844", "11032", "11930"):
-            with self.subTest(number=number):
-                selected = service._select_official_sources(f"Explain RA {number}", sources)
-                self.assertEqual(len(selected), 1)
-                self.assertEqual(selected[0].source_type, f"RA_{number}")
-
-    def test_selects_multiple_explicit_acts_for_comparison(self) -> None:
-        settings = SimpleNamespace(
-            judiciary_ra_10173_url="https://example.com/ra-10173",
-            judiciary_ra_10175_url="https://example.com/ra-10175",
-            judiciary_ra_8792_url="https://example.com/ra-8792",
-            judiciary_ra_9470_url="https://example.com/ra-9470",
-            judiciary_ra_10844_url="https://example.com/ra-10844",
-            judiciary_ra_11032_url="https://example.com/ra-11032",
-            judiciary_ra_11930_url="https://example.com/ra-11930",
-        )
-        service = RetrievalService(settings, SimpleNamespace(), SimpleNamespace())
-
-        selected = service._select_official_sources(
-            "Compare RA 10173 and Republic Act 10175",
-            service._official_sources(),
-        )
-
-        self.assertEqual(
-            [source.source_type for source in selected],
-            ["RA_10173", "RA_10175"],
-        )
-
-    def test_selects_npc_issuance_index_for_circular_questions(self) -> None:
-        settings = SimpleNamespace(
-            judiciary_ra_10173_url="https://example.com/ra-10173",
-            judiciary_ra_10175_url="https://example.com/ra-10175",
-            judiciary_ra_8792_url="https://example.com/ra-8792",
-            judiciary_ra_9470_url="https://example.com/ra-9470",
-            judiciary_ra_10844_url="https://example.com/ra-10844",
-            judiciary_ra_11032_url="https://example.com/ra-11032",
-            judiciary_ra_11930_url="https://example.com/ra-11930",
-        )
-        service = RetrievalService(settings, SimpleNamespace(), SimpleNamespace())
-
-        selected = service._select_official_sources(
-            "Explain NPC Circular 2024-02",
-            service._official_sources(),
-        )
-
-        self.assertEqual(
-            [source.source_type for source in selected],
-            ["NPC_ISSUANCES"],
-        )
+    def test_preserves_complete_legal_sections(self):
+        text = "SEC. 15. Other.\nOther text.\nSEC. 16. Data subject rights.\n(a) Access.\n(b) Correction.\nSEC. 17. Other.\nOther text."
+        selected = self.service._select_relevant_passages("What are data subject rights?", text)
+        self.assertIn("(a) Access.", selected)
+        self.assertIn("(b) Correction.", selected)
 
 
 if __name__ == "__main__":

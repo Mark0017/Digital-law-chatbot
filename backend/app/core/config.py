@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     embedding_model: str = "gemini-embedding-2"
     embedding_dimension: int = Field(default=768, ge=128, le=3072)
     web_search_enabled: bool = True
+    primary_privacy_pdf_path: str = "Data_Privacy_Act_RA10173.pdf"
     official_text_gateway_url: str | None = "https://r.jina.ai/"
 
     supabase_url: str

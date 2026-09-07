@@ -20,7 +20,7 @@ class GeminiRoutingTests(unittest.TestCase):
 
         self.assertEqual(result, ScopeClassification.DIGITAL_LAW_RELATED)
 
-    def test_classifies_other_supported_laws_locally(self) -> None:
+    def test_other_laws_require_privacy_scope_evaluation(self) -> None:
         questions = (
             "What is illegal access under RA 10175?",
             "Are electronic signatures valid under RA 8792?",
@@ -33,7 +33,7 @@ class GeminiRoutingTests(unittest.TestCase):
         for question in questions:
             with self.subTest(question=question):
                 result = GeminiService.classify_scope_locally(question)
-                self.assertEqual(result, ScopeClassification.DIGITAL_LAW_RELEVANT)
+                self.assertIsNone(result)
 
     def test_classifies_unregistered_republic_act_for_official_lookup(self) -> None:
         result = GeminiService.classify_scope_locally(

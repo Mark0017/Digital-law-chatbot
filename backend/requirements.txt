@@ -5,3 +5,4 @@ httpx>=0.28,<1.0
 truststore>=0.10,<1.0
 google-genai>=1.30,<2.0
 beautifulsoup4>=4.13,<5.0
+pypdf>=6.0,<7.0

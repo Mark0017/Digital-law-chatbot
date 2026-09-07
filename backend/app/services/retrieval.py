@@ -1,22 +1,28 @@
 import asyncio
 import logging
+import io
 import re
 import ssl
 import time
 from dataclasses import dataclass
+from datetime import date
 from urllib.parse import urlparse
 
 import httpx
 import truststore
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 
 from app.core.config import Settings
 from app.schemas.chat import Source
 from app.services.gemini import GeminiService
 from app.services.supabase import SupabaseService
+from app.services.evidence import RelevanceAssessment, UNABLE_TO_VERIFY, PDF_UNABLE_TO_VERIFY, is_privacy_pdf_question
+from app.services.evidence import source_tier
+from app.services.npc import parse_index, match_issuances, identity_question
 
 
-_official_text_cache: dict[str, str] = {}
+_official_text_cache: dict[str, tuple[float, str]] = {}
 _official_text_locks: dict[str, asyncio.Lock] = {}
 _knowledge_base_cache: tuple[float, bool] | None = None
 _knowledge_base_lock = asyncio.Lock()
@@ -39,10 +45,6 @@ class OfficialLegalSource:
     markers: tuple[str, ...]
 
 
-_dynamic_source_cache: dict[str, OfficialLegalSource] = {}
-_dynamic_source_locks: dict[str, asyncio.Lock] = {}
-
-
 class RetrievalService:
     def __init__(
         self,
@@ -55,168 +57,192 @@ class RetrievalService:
         self.supabase = supabase
 
     async def retrieve(self, question: str) -> RetrievalResult:
-        if self._is_latest_npc_circular_question(question):
-            latest_circular = await self._retrieve_latest_npc_circular()
-            if latest_circular.context:
-                return latest_circular
-
-        web_search_attempted = self._requires_current_web_search(question)
-        if web_search_attempted:
-            web_result = await self._search_official_web(question)
-            if web_result.context:
-                return web_result
-
-        explicit_numbers = self._extract_ra_numbers(question)
+        pdf_only = is_privacy_pdf_question(question)
+        search_question = f"Data Privacy Act of 2012 (RA 10173): {question}" if pdf_only else question
         chunks: list[dict] = []
         try:
             if await self._knowledge_base_is_ready():
-                embedding = await self.gemini.embed_question(question)
+                embedding = await self.gemini.embed_question(search_question)
+                filters = {"source_types": ["RA_10173"]} if pdf_only else {}
                 chunks = await self.supabase.match_document_chunks(
                     embedding,
                     self.settings.retrieval_match_threshold,
                     self.settings.retrieval_match_count,
+                    **filters,
                 )
-        except (httpx.HTTPError, RuntimeError):
-            chunks = []
+        except Exception as exc:
+            logger.warning("Vector retrieval unavailable: %s", type(exc).__name__)
 
-        chunk_source_types = {chunk.get("source_type") for chunk in chunks}
-        chunks_cover_explicit_acts = all(
-            f"RA_{number}" in chunk_source_types for number in explicit_numbers
-        )
-        if chunks and chunks_cover_explicit_acts:
-            context_parts: list[str] = []
-            sources: list[Source] = []
-            seen_sources: set[tuple[str, str | None, str]] = set()
-            for index, chunk in enumerate(chunks, start=1):
-                context_parts.append(
-                    f"[Source {index}: {chunk['source_title']}]\n{chunk['content']}"
-                )
-                url = chunk.get("source_url") or self.settings.npc_dpa_url
-                source_key = (chunk["source_title"], chunk.get("section"), url)
-                if source_key not in seen_sources:
-                    seen_sources.add(source_key)
-                    sources.append(
-                        Source(
-                            title=chunk["source_title"],
-                            section=chunk.get("section"),
-                            url=url,
-                            page=chunk.get("page_number"),
-                        )
-                    )
-            return RetrievalResult(context="\n\n".join(context_parts), sources=sources)
+        if pdf_only:
+            return await self._retrieve_from_primary_pdf(search_question, chunks)
 
-        official_sources = self._select_official_sources(
-            question,
-            self._official_sources(),
-        )
-        selected_numbers = {
-            source.source_type.removeprefix("RA_") for source in official_sources
-        }
-        missing_numbers = [
-            number for number in explicit_numbers if number not in selected_numbers
-        ]
-        if missing_numbers:
-            dynamic_sources = await asyncio.gather(
-                *(self._resolve_dynamic_source(number) for number in missing_numbers)
+        knowledge = self._chunks_to_evidence(chunks)
+        assessment = await self._assess(question, knowledge)
+        current = self._requires_current_web_search(question) or assessment.requires_current_web
+        knowledge = self._retain_sources(knowledge, assessment.relevant_sources)
+        logger.info("Privacy retrieval: chunks=%d relevant_sources=%d sufficient=%s current=%s",
+                    len(chunks), len(knowledge.sources), assessment.is_sufficient, current)
+        if assessment.is_sufficient and not current:
+            return knowledge
+        if not self.settings.web_search_enabled:
+            return RetrievalResult("", [], UNABLE_TO_VERIFY)
+
+        # Search the complete official issuance catalog before relying on Gemini's
+        # search quota. Index identity lookups are directly verifiable facts.
+        direct = await self._direct_privacy_evidence(question, fresh=current)
+        if direct.answer:
+            return direct
+        combined = self._merge_evidence(knowledge, direct)
+        if direct.context:
+            evaluation = await self._assess(question, combined)
+            if evaluation.is_sufficient and any(
+                combined.sources[i - 1].origin == "web" for i in evaluation.relevant_sources
+            ):
+                return self._retain_sources(combined, evaluation.relevant_sources)
+            combined = self._retain_sources(combined, evaluation.relevant_sources)
+
+        # Search NPC first, then expand to government/Lawphil only if insufficient.
+        # Partial, relevant PDF evidence is retained for fusion and conflict analysis.
+        for tier in (1, 2):
+            web = await self._search_official_web(question, tier=tier)
+            combined = self._merge_evidence(combined, web)
+            evaluation = await self._assess(question, combined)
+            has_web = any(
+                combined.sources[i - 1].origin == "web" for i in evaluation.relevant_sources
             )
-            official_sources.extend(
-                source for source in dynamic_sources if source is not None
-            )
-        if not official_sources:
-            if web_search_attempted:
-                return RetrievalResult(context="", sources=[])
-            return await self._search_official_web(question)
+            if evaluation.is_sufficient and has_web:
+                logger.info("Privacy retrieval: route=%s tier=%d",
+                            "hybrid" if knowledge.sources else "web", tier)
+                return self._retain_sources(combined, evaluation.relevant_sources)
+            combined = self._retain_sources(combined, evaluation.relevant_sources)
 
-        source_texts = await asyncio.gather(
-            *(self._get_official_source_text(source) for source in official_sources)
-        )
-        context_parts: list[str] = []
+        logger.info("Privacy retrieval: route=unable_to_verify")
+        return RetrievalResult("", [], UNABLE_TO_VERIFY)
+
+    async def _retrieve_from_primary_pdf(self, question: str, chunks: list[dict]) -> RetrievalResult:
+        if self._requires_current_web_search(question):
+            return RetrievalResult("", [], PDF_UNABLE_TO_VERIFY)
+        chunks = [c for c in chunks if c.get("storage_path") == self.settings.primary_privacy_pdf_path]
+        numbers = [int(n) for n in re.findall(r"\b(?:section|sec\.?)\s+(\d+)\b", question, re.I)]
+        evidence = self._chunks_to_evidence(chunks)
+        if evidence.context and not numbers:
+            assessment = await self._assess(question, evidence)
+            if assessment.is_sufficient and not assessment.requires_current_web:
+                return self._retain_sources(evidence, assessment.relevant_sources)
+        # Exact section lookups should not miss a provision due to a vector threshold.
+        # The selected small PDF can also supply missing context without a web fallback.
+        try:
+            chunks = await self.supabase.get_pdf_chunks(self.settings.primary_privacy_pdf_path, numbers)
+        except Exception as exc:
+            logger.warning("Primary PDF lookup unavailable: %s", type(exc).__name__)
+            return RetrievalResult("", [], PDF_UNABLE_TO_VERIFY)
+        evidence = self._chunks_to_evidence(chunks, exact_pdf=True)
+        assessment = await self._assess(question, evidence)
+        if assessment.is_sufficient and not assessment.requires_current_web:
+            return self._retain_sources(evidence, assessment.relevant_sources)
+        return RetrievalResult("", [], PDF_UNABLE_TO_VERIFY)
+
+    async def _assess(self, question: str, result: RetrievalResult) -> RelevanceAssessment:
+        if result.context and result.sources:
+            try:
+                return await self.gemini.evaluate_relevance(question, result.context, result.sources)
+            except Exception as exc:
+                logger.warning("Evidence evaluation unavailable: %s", type(exc).__name__)
+        return RelevanceAssessment(is_sufficient=False, relevant_sources=[],
+                                   requires_current_web=False, reason="No verified sufficient evidence")
+
+    def _chunks_to_evidence(self, chunks: list[dict], exact_pdf: bool = False) -> RetrievalResult:
         sources: list[Source] = []
-        for source, source_text in zip(official_sources, source_texts, strict=True):
-            relevant_text = self._select_relevant_passages(question, source_text)
-            if not relevant_text:
+        parts: list[str] = []
+        seen: dict[tuple, int] = {}
+        for chunk in chunks[:200 if exact_pdf else self.settings.retrieval_match_count]:
+            try:
+                similarity = float(chunk.get("similarity", -1))
+                if (not chunk.get("is_authoritative") or not chunk.get("content", "").strip()
+                        or (not exact_pdf and not self.settings.retrieval_match_threshold <= similarity <= 1)):
+                    continue
+                source = Source(
+                    title=chunk["source_title"], url=chunk.get("source_url") or None,
+                    section=chunk.get("section"), page=chunk.get("page_number"),
+                    origin="knowledge_base", document_id=chunk["document_id"],
+                    publication_date=chunk.get("publication_date"),
+                )
+                key = (source.document_id, source.section, source.page, str(source.url))
+                if key not in seen:
+                    sources.append(source)
+                    seen[key] = len(sources)
+                confidence = "Selected uploaded PDF text" if exact_pdf else f"Similarity: {similarity:.3f}"
+                parts.append(f"[Source {seen[key]}: Knowledge Base Source - {source.title}]\n"
+                             f"{confidence}\n{chunk['content'][:12000]}")
+            except (ValueError, TypeError, KeyError):
                 continue
-            source_number = len(sources) + 1
-            context_parts.append(
-                f"[Source {source_number}: {source.title}]\n{relevant_text}"
-            )
-            sources.append(Source(title=source.title, url=source.url))
+        return RetrievalResult("\n\n".join(parts), sources)
 
-        result = RetrievalResult(context="\n\n".join(context_parts), sources=sources)
-        if result.context:
-            return result
-        if web_search_attempted:
-            return result
-        return await self._search_official_web(question)
+    @staticmethod
+    def _retain_sources(result: RetrievalResult, indices: list[int]) -> RetrievalResult:
+        indices = sorted(set(indices))
+        mapping = {old: new for new, old in enumerate(indices, 1)}
+        parts = []
+        for block in re.split(r"(?=\[Source \d+:)", result.context):
+            match = re.match(r"\[Source (\d+):", block)
+            if match and int(match.group(1)) in mapping:
+                parts.append(re.sub(r"^\[Source \d+:", f"[Source {mapping[int(match.group(1))]}:", block))
+        return RetrievalResult("\n\n".join(parts), [result.sources[i - 1] for i in indices])
 
-    async def _search_official_web(self, question: str) -> RetrievalResult:
+    @staticmethod
+    def _merge_evidence(left: RetrievalResult, right: RetrievalResult) -> RetrievalResult:
+        offset = len(left.sources)
+        context = re.sub(r"\[Source (\d+):", lambda m: f"[Source {int(m.group(1)) + offset}:", right.context)
+        return RetrievalResult("\n\n".join(filter(None, [left.context, context])), left.sources + right.sources)
+
+    async def _direct_privacy_evidence(self, question: str, fresh: bool) -> RetrievalResult:
+        source = OfficialLegalSource("RA_10173", "Data Privacy Act of 2012",
+                                     self.settings.npc_dpa_url, ())
+        if re.search(r"\bnpc\b|national privacy commission|circular|advisory|issuance|compliance checks", question, re.I):
+            source = OfficialLegalSource("NPC_ISSUANCES", "NPC Advisories and Circulars",
+                                         self.settings.npc_issuances_url, ())
+        text = await self._get_official_source_text(source, fresh=fresh)
+        if source.source_type == "NPC_ISSUANCES":
+            matches = match_issuances(question, parse_index(text, source.url))
+            if matches:
+                parts = []
+                sources = []
+                for entry in matches:
+                    sources.append(Source(title=f"NPC index: {entry.identifier} - {entry.title}",
+                                          url=source.url, origin="web", retrieved_at=date.today()))
+                    parts.append(f"[Source {len(sources)}: Web Source - NPC issuance index]\n"
+                                 f"The official index lists {entry.identifier}: {entry.title}.\n"
+                                 f"Linked document: {entry.url}")
+                    if len(matches) == 1 and identity_question(question, entry):
+                        return RetrievalResult("\n\n".join(parts), sources,
+                            f"{entry.identifier} is titled “{entry.title},” according to the "
+                            "National Privacy Commission's official issuance index. [1]")
+                    document = OfficialLegalSource("NPC_ISSUANCE", f"{entry.identifier} - {entry.title}", entry.url, ())
+                    body = await self._get_official_source_text(document, fresh=fresh)
+                    if body:
+                        sources.append(Source(title=document.title, url=entry.url, origin="web", retrieved_at=date.today()))
+                        parts.append(f"[Source {len(sources)}: Web Source - {document.title}]\n"
+                                     + self._select_relevant_passages(question, body))
+                return RetrievalResult("\n\n".join(parts), sources)
+        text = self._select_relevant_passages(question, text)
+        if not text:
+            return RetrievalResult("", [])
+        return RetrievalResult(f"[Source 1: Web Source - {source.title}]\n{text}", [
+            Source(title=source.title, url=source.url, origin="web", retrieved_at=date.today())
+        ])
+
+    async def _search_official_web(self, question: str, tier: int = 1) -> RetrievalResult:
         if not getattr(self.settings, "web_search_enabled", True):
             return RetrievalResult(context="", sources=[])
         search = getattr(self.gemini, "search_official_web", None)
         if search is None:
             return RetrievalResult(context="", sources=[])
         try:
-            context, sources = await search(question)
+            context, sources = await search(question, tier=tier)
         except Exception as exc:
             logger.warning("Official web fallback failed: %s", type(exc).__name__)
             return RetrievalResult(context="", sources=[])
         return RetrievalResult(context=context, sources=sources)
-
-    async def _retrieve_latest_npc_circular(self) -> RetrievalResult:
-        source = next(
-            source
-            for source in self._official_sources()
-            if source.source_type == "NPC_ISSUANCES"
-        )
-        source_text = await self._get_official_source_text(source)
-        circular = self._parse_latest_npc_circular(source_text)
-        if circular is None:
-            return RetrievalResult(context="", sources=[])
-
-        identifier, title, url = circular
-        citation = Source(title=f"{identifier} - {title}", url=url)
-        answer = (
-            "The latest circular listed by the National Privacy Commission is "
-            f"**{identifier} - {title}** [1]."
-        )
-        context = (
-            "The National Privacy Commission's current circular index lists "
-            f"{identifier}, titled {title}, as its latest circular."
-        )
-        return RetrievalResult(context=context, sources=[citation], answer=answer)
-
-    @staticmethod
-    def _parse_latest_npc_circular(
-        page_text: str,
-    ) -> tuple[str, str, str] | None:
-        circulars_heading = re.search(r"(?im)^#{0,6}\s*CIRCULARS\s*$", page_text)
-        if circulars_heading is None:
-            return None
-        circulars_text = page_text[circulars_heading.end():]
-        pattern = re.compile(
-            r"NPC\s+Circular(?:\s+No\.)?\s+(\d{4})\s*-\s*(\d{1,3})"
-            r"\s*-?\s*\**\s*\[([^\]]+)\]\((https?://[^)]+)\)",
-            re.IGNORECASE,
-        )
-        candidates: list[tuple[int, int, str, str]] = []
-        for match in pattern.finditer(circulars_text):
-            year = int(match.group(1))
-            number = int(match.group(2))
-            title = " ".join(match.group(3).split())
-            url = match.group(4).strip()
-            parsed_url = urlparse(url)
-            if (
-                parsed_url.scheme != "https"
-                or parsed_url.hostname not in {"privacy.gov.ph", "www.privacy.gov.ph"}
-                or not parsed_url.path.startswith("/wp-content/uploads/")
-            ):
-                continue
-            candidates.append((year, number, title, url))
-        if not candidates:
-            return None
-
-        year, number, title, url = max(candidates, key=lambda item: item[:2])
-        return f"NPC Circular No. {year}-{number:02d}", title, url
 
     @staticmethod
     def _requires_current_web_search(question: str) -> bool:
@@ -225,6 +251,8 @@ class RetrievalService:
             "latest", "newest", "most recent", "currently", "current",
             "recently released", "as of today", "this year", "new circular",
             "new advisory", "new issuance",
+            "recent", "amendment", "amended", "newly issued", "changes",
+            "updated", "new guidance", "new rules",
         )
         return any(marker in normalized for marker in freshness_markers)
 
@@ -241,93 +269,6 @@ class RetrievalService:
             and cls._requires_current_web_search(normalized)
         )
 
-    async def _resolve_dynamic_source(
-        self,
-        ra_number: str,
-    ) -> OfficialLegalSource | None:
-        if ra_number in _dynamic_source_cache:
-            return _dynamic_source_cache[ra_number]
-
-        source_lock = _dynamic_source_locks.setdefault(ra_number, asyncio.Lock())
-        async with source_lock:
-            if ra_number in _dynamic_source_cache:
-                return _dynamic_source_cache[ra_number]
-
-            source: OfficialLegalSource | None = None
-            try:
-                async with self._official_http_client() as client:
-                    index_response = await client.get(
-                        self.settings.judiciary_republic_acts_url
-                    )
-                    index_response.raise_for_status()
-                    csrf_match = re.search(
-                        r"['\"]csrf_test_name['\"]\s*:\s*['\"]([^'\"]+)['\"]",
-                        index_response.text,
-                    )
-                    if csrf_match is None:
-                        return None
-
-                    search_response = await client.post(
-                        self.settings.judiciary_republic_acts_search_url,
-                        data={
-                            "csrf_test_name": csrf_match.group(1),
-                            "draw": "1",
-                            "start": "0",
-                            "length": "25",
-                            "search[value]": ra_number,
-                            "search[regex]": "false",
-                        },
-                    )
-                    search_response.raise_for_status()
-                    source = self._parse_dynamic_source(
-                        ra_number,
-                        search_response.json(),
-                    )
-            except (httpx.HTTPError, ValueError, TypeError):
-                source = None
-
-            if source is not None:
-                _dynamic_source_cache[ra_number] = source
-            return source
-
-    @staticmethod
-    def _parse_dynamic_source(
-        ra_number: str,
-        payload: object,
-    ) -> OfficialLegalSource | None:
-        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-            return None
-
-        exact_label = re.compile(
-            rf"^REPUBLIC\s+ACT\s+NO\.?\s*{re.escape(ra_number)}$",
-            re.IGNORECASE,
-        )
-        for row in payload["data"]:
-            if not isinstance(row, list) or len(row) < 3:
-                continue
-            label = " ".join(str(row[0]).split())
-            if exact_label.fullmatch(label) is None:
-                continue
-
-            link = BeautifulSoup(str(row[2]), "html.parser").find("a", href=True)
-            if link is None:
-                continue
-            url = str(link["href"])
-            parsed_url = urlparse(url)
-            if (
-                parsed_url.scheme != "https"
-                or parsed_url.hostname != "elibrary.judiciary.gov.ph"
-                or not parsed_url.path.startswith("/thebookshelf/showdocs/2/")
-            ):
-                continue
-            return OfficialLegalSource(
-                source_type=f"RA_{ra_number}",
-                title=f"Republic Act No. {ra_number}",
-                url=url,
-                markers=(),
-            )
-        return None
-
     @staticmethod
     def _official_http_client() -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -337,35 +278,52 @@ class RetrievalService:
             headers={"User-Agent": "DigitalLawPH-Assistant/1.0"},
         )
 
-    async def _get_official_source_text(self, source: OfficialLegalSource) -> str:
-        if source.url in _official_text_cache:
-            return _official_text_cache[source.url]
+    async def _get_official_source_text(self, source: OfficialLegalSource, fresh: bool = False) -> str:
+        cached = _official_text_cache.get(source.url)
+        if not fresh and cached and time.monotonic() - cached[0] < 300:
+            return cached[1]
 
         source_lock = _official_text_locks.setdefault(source.url, asyncio.Lock())
         async with source_lock:
-            if source.url in _official_text_cache:
-                return _official_text_cache[source.url]
+            cached = _official_text_cache.get(source.url)
+            if not fresh and cached and time.monotonic() - cached[0] < 300:
+                return cached[1]
             try:
                 async with self._official_http_client() as client:
                     response = await client.get(source.url)
                 response.raise_for_status()
+                if source_tier(str(response.url)) is None or len(response.content) > self.settings.max_upload_bytes:
+                    return ""
             except httpx.HTTPError:
                 source_text = await self._get_official_text_through_gateway(source)
                 if not source_text:
                     return ""
             else:
+                if response.content.startswith(b"%PDF-"):
+                    try:
+                        reader = PdfReader(io.BytesIO(response.content))
+                        source_text = "\n\n".join(
+                            f"Page {i}\n{page.extract_text() or ''}" for i, page in enumerate(reader.pages, 1)
+                        )
+                    except Exception as exc:
+                        logger.warning("Official PDF extraction failed: %s", type(exc).__name__)
+                        return ""
+                    _official_text_cache[source.url] = (time.monotonic(), source_text)
+                    return source_text
                 soup = BeautifulSoup(response.text, "html.parser")
                 for element in soup(
                     ["script", "style", "nav", "footer", "form", "noscript"]
                 ):
                     element.decompose()
+                for anchor in soup.find_all("a", href=True):
+                    anchor.replace_with(f"[{anchor.get_text(' ', strip=True)}]({anchor['href']})")
                 units = [
                     " ".join(line.split())
                     for line in soup.get_text("\n", strip=True).splitlines()
                     if len(" ".join(line.split())) >= 2
                 ]
                 source_text = "\n".join(units)
-            _official_text_cache[source.url] = source_text
+            _official_text_cache[source.url] = (time.monotonic(), source_text)
             return source_text
 
     async def _get_official_text_through_gateway(
@@ -406,135 +364,6 @@ class RetrievalService:
         ):
             return ""
         return response.text
-
-    def _official_sources(self) -> tuple[OfficialLegalSource, ...]:
-        return (
-            OfficialLegalSource(
-                source_type="NPC_ISSUANCES",
-                title="NPC Advisories and Circulars",
-                url=getattr(
-                    self.settings,
-                    "npc_issuances_url",
-                    "https://privacy.gov.ph/pips-and-pics/advisories-circulars/",
-                ),
-                markers=(
-                    "npc circular", "npc advisory", "npc issuance",
-                    "national privacy commission", "privacy commission",
-                ),
-            ),
-            OfficialLegalSource(
-                source_type="RA_10173",
-                title="Republic Act No. 10173 - Data Privacy Act of 2012",
-                url=self.settings.judiciary_ra_10173_url,
-                markers=(
-                    "data privacy", "personal data", "personal information",
-                    "data subject", "consent", "privacy notice", "dpo",
-                ),
-            ),
-            OfficialLegalSource(
-                source_type="RA_10175",
-                title="Republic Act No. 10175 - Cybercrime Prevention Act of 2012",
-                url=self.settings.judiciary_ra_10175_url,
-                markers=(
-                    "cybercrime", "illegal access", "illegal interception",
-                    "data interference", "system interference", "cyber libel",
-                    "computer related", "misuse of devices",
-                ),
-            ),
-            OfficialLegalSource(
-                source_type="RA_8792",
-                title="Republic Act No. 8792 - Electronic Commerce Act of 2000",
-                url=self.settings.judiciary_ra_8792_url,
-                markers=(
-                    "electronic commerce", "e commerce", "electronic document",
-                    "electronic data", "electronic signature", "digital signature",
-                    "electronic transaction",
-                ),
-            ),
-            OfficialLegalSource(
-                source_type="RA_9470",
-                title="Republic Act No. 9470 - National Archives of the Philippines Act of 2007",
-                url=self.settings.judiciary_ra_9470_url,
-                markers=(
-                    "national archives", "public archive", "public record",
-                    "archival record", "records management", "government record",
-                ),
-            ),
-            OfficialLegalSource(
-                source_type="RA_10844",
-                title="Republic Act No. 10844 - DICT Act of 2015",
-                url=self.settings.judiciary_ra_10844_url,
-                markers=(
-                    "department of information and communications technology",
-                    "dict", "ict governance", "ict infrastructure",
-                    "digital infrastructure", "national ict",
-                ),
-            ),
-            OfficialLegalSource(
-                source_type="RA_11032",
-                title="Republic Act No. 11032 - Ease of Doing Business Act of 2018",
-                url=self.settings.judiciary_ra_11032_url,
-                markers=(
-                    "ease of doing business", "government service", "red tape",
-                    "citizen charter", "automatic approval", "processing time",
-                    "business one stop shop",
-                ),
-            ),
-            OfficialLegalSource(
-                source_type="RA_11930",
-                title="Republic Act No. 11930 - Anti-OSAEC and Anti-CSAEM Act",
-                url=self.settings.judiciary_ra_11930_url,
-                markers=(
-                    "osaec", "csaem", "online sexual abuse", "online child exploitation",
-                    "child sexual abuse material", "grooming", "child exploitation",
-                ),
-            ),
-        )
-
-    @staticmethod
-    def _extract_ra_numbers(question: str) -> list[str]:
-        return list(dict.fromkeys(
-            re.findall(
-                r"(?:ra|republic\s+act)\s*(\d{4,5})",
-                question.lower(),
-            )
-        ))
-
-    @staticmethod
-    def _select_official_sources(
-        question: str,
-        sources: tuple[OfficialLegalSource, ...],
-    ) -> list[OfficialLegalSource]:
-        lowered = question.lower()
-        explicit_numbers = RetrievalService._extract_ra_numbers(lowered)
-        if explicit_numbers:
-            source_by_number = {
-                source.source_type.removeprefix("RA_"): source
-                for source in sources
-            }
-            return [
-                source_by_number[number]
-                for number in explicit_numbers
-                if number in source_by_number
-            ]
-
-        normalized = " ".join(re.findall(r"[a-z0-9]+", lowered))
-        scored = [
-            (
-                sum(1 for marker in source.markers if marker in normalized),
-                index,
-                source,
-            )
-            for index, source in enumerate(sources)
-        ]
-        matches = [item for item in scored if item[0] > 0]
-        return [
-            source
-            for _score, _index, source in sorted(
-                matches,
-                key=lambda item: (-item[0], item[1]),
-            )[:3]
-        ]
 
     async def _knowledge_base_is_ready(self) -> bool:
         global _knowledge_base_cache

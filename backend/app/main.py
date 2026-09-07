@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 settings = get_settings()
 
 app = FastAPI(
-    title="Philippine Digital Law AI Assistant API",
+    title="Philippine Data Privacy AI Assistant API",
     version="0.1.0",
     docs_url="/docs",
     redoc_url=None,

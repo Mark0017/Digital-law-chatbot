@@ -4,8 +4,8 @@ import SourceCard from './SourceCard'
 
 const suggestions = [
   'What rights do data subjects have under RA 10173?',
-  'What is illegal access under RA 10175?',
-  'When is an electronic document valid under RA 8792?',
+  'Can an employer collect employee fingerprints?',
+  'What is the latest NPC circular on data privacy?',
 ]
 
 function ChatView({ messages, loadingMessages, sending, error, onOpenSidebar, onSend }) {
@@ -45,7 +45,7 @@ function ChatView({ messages, loadingMessages, sending, error, onOpenSidebar, on
           <Menu size={21} />
         </button>
         <div>
-          <strong>Philippine Digital Law Assistant</strong>
+          <strong>Philippine Data Privacy Assistant</strong>
           <span><i aria-hidden="true" /> Grounded in official sources</span>
         </div>
         <ShieldCheck className="header-shield" size={24} aria-hidden="true" />
@@ -59,7 +59,7 @@ function ChatView({ messages, loadingMessages, sending, error, onOpenSidebar, on
             <span className="empty-chat-icon" aria-hidden="true"><BookOpenCheck size={31} /></span>
             <p className="eyebrow">Official-source research</p>
             <h1>What would you like to understand?</h1>
-            <p className="empty-chat-copy">Ask about Philippine privacy, cybercrime, electronic transactions, public archives, ICT governance, government services, or online child protection.</p>
+            <p className="empty-chat-copy">Ask about Philippine data privacy, personal data protection, data subject rights, or National Privacy Commission guidance.</p>
             <div className="suggestion-list">
               {suggestions.map((suggestion) => (
                 <button type="button" key={suggestion} onClick={() => onSend(suggestion)} disabled={sending}>
@@ -88,14 +88,14 @@ function ChatView({ messages, loadingMessages, sending, error, onOpenSidebar, on
                     <div className="sources-block">
                       <p>Sources</p>
                       <div className="source-list">
-                        {sources.map((source, index) => <SourceCard source={source} key={`${source.url || source.title}-${index}`} />)}
+                        {sources.map((source, index) => <SourceCard source={source} number={index + 1} key={`${source.url || source.title}-${index}`} />)}
                       </div>
                     </div>
                   )}
                 </article>
               )
             })}
-            {sending && <div className="retrieval-status" role="status"><span className="spinner" aria-hidden="true" />Searching official Philippine legal sources...</div>}
+            {sending && <div className="retrieval-status" role="status"><span className="spinner" aria-hidden="true" />Checking privacy documents and supporting sources...</div>}
           </div>
         )}
         <div ref={bottomRef} />
@@ -104,7 +104,7 @@ function ChatView({ messages, loadingMessages, sending, error, onOpenSidebar, on
       <footer className="composer-region">
         {error && <div className="chat-error" role="alert">{error}</div>}
         <form className="composer" onSubmit={submitMessage}>
-          <textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={handleKeyDown} placeholder="Ask about a supported Philippine digital law..." rows={1} maxLength={4000} aria-label="Message" />
+          <textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={handleKeyDown} placeholder="Ask about Philippine data privacy..." rows={1} maxLength={4000} aria-label="Message" />
           <button type="submit" className="send-button" disabled={!draft.trim() || sending} aria-label="Send message" title="Send message"><Send size={19} /></button>
         </form>
         <p className="composer-disclaimer">General information only. Verify important matters with the relevant agency or a qualified legal professional.</p>

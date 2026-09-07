@@ -36,12 +36,13 @@ class SupabaseService:
         embedding: list[float],
         threshold: float,
         count: int,
+        source_types: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         body = {
             "query_embedding": embedding,
             "match_threshold": threshold,
             "match_count": count,
-            "filter_source_types": None,
+            "filter_source_types": source_types,
         }
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
@@ -49,14 +50,60 @@ class SupabaseService:
                 headers=self.headers,
                 json=body,
             )
-        response.raise_for_status()
-        return response.json()
+            response.raise_for_status()
+            chunks = response.json()
+            if not chunks:
+                return []
+            document_ids = list(dict.fromkeys(str(UUID(c["document_id"])) for c in chunks))
+            documents_response = await client.get(
+                f"{self.base_url}/rest/v1/documents",
+                headers=self.headers,
+                params={
+                    "id": f"in.({','.join(document_ids)})",
+                    "select": "id,is_authoritative,publication_date,document_date,storage_path",
+                    "is_authoritative": "eq.true",
+                    "is_active": "eq.true",
+                    "processing_status": "eq.ready",
+                },
+            )
+            documents_response.raise_for_status()
+        documents = {d["id"]: d for d in documents_response.json()}
+        return [
+            {**chunk, "is_authoritative": True,
+             "storage_path": documents[chunk["document_id"]].get("storage_path"),
+             "publication_date": documents[chunk["document_id"]].get("publication_date")
+                 or documents[chunk["document_id"]].get("document_date")}
+            for chunk in chunks if chunk["document_id"] in documents
+        ]
+
+    async def get_pdf_chunks(self, storage_path: str, section_numbers: list[int]) -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(headers=self.headers, timeout=20) as client:
+            response = await client.get(f"{self.base_url}/rest/v1/documents", params={
+                "select": "id,title,source_type,storage_path,publication_date",
+                "storage_path": f"eq.{storage_path}", "source_type": "eq.RA_10173",
+                "processing_status": "eq.ready", "is_active": "eq.true", "is_authoritative": "eq.true",
+            })
+            response.raise_for_status()
+            documents = response.json()
+            if not documents:
+                return []
+            document = documents[0]
+            params = {"select": "content,section,page_number,chunk_index,document_id,metadata",
+                      "document_id": f"eq.{document['id']}", "order": "chunk_index", "limit": "200"}
+            if section_numbers:
+                params["or"] = "(" + ",".join(f"section.ilike.Section {n}.*" for n in section_numbers) + ")"
+            response = await client.get(f"{self.base_url}/rest/v1/document_chunks", params=params)
+            response.raise_for_status()
+        return [{**chunk, "source_title": document["title"], "source_type": document["source_type"],
+                 "storage_path": document["storage_path"], "is_authoritative": True,
+                 "publication_date": document.get("publication_date")} for chunk in response.json()]
 
     async def has_ready_documents(self) -> bool:
         params = {
             "select": "id",
             "is_active": "eq.true",
             "processing_status": "eq.ready",
+            "is_authoritative": "eq.true",
             "limit": "1",
         }
         async with httpx.AsyncClient(timeout=10) as client:

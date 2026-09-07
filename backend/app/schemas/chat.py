@@ -1,4 +1,6 @@
 from enum import StrEnum
+from datetime import date
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
@@ -26,8 +28,12 @@ class ChatRequest(BaseModel):
 class Source(BaseModel):
     title: str
     section: str | None = None
-    url: HttpUrl
+    url: HttpUrl | None = None
     page: int | None = None
+    origin: Literal["knowledge_base", "web"] = "web"
+    document_id: str | None = None
+    publication_date: date | None = None
+    retrieved_at: date | None = None
 
 
 class ChatResponse(BaseModel):
