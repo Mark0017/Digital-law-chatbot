@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from app.schemas.chat import ScopeClassification
 from app.services.gemini import GeminiService
@@ -45,6 +46,51 @@ class GeminiRoutingTests(unittest.TestCase):
         result = GeminiService.classify_scope_locally("How do I bake bread?")
 
         self.assertIsNone(result)
+
+    def test_accepts_grounding_only_from_official_government_domains(self) -> None:
+        response = SimpleNamespace(
+            candidates=[SimpleNamespace(
+                grounding_metadata=SimpleNamespace(
+                    grounding_chunks=[SimpleNamespace(web=SimpleNamespace(
+                        domain="privacy.gov.ph",
+                        title="Advisories & Circulars - National Privacy Commission",
+                        uri="https://privacy.gov.ph/pips-and-pics/advisories-circulars/",
+                    ))],
+                    grounding_supports=[SimpleNamespace(
+                        grounding_chunk_indices=[0],
+                    )],
+                )
+            )]
+        )
+
+        sources = GeminiService._extract_official_grounding_sources(response)
+
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(
+            sources[0].title,
+            "Advisories & Circulars - National Privacy Commission",
+        )
+
+    def test_rejects_grounding_that_uses_non_government_sources(self) -> None:
+        response = SimpleNamespace(
+            candidates=[SimpleNamespace(
+                grounding_metadata=SimpleNamespace(
+                    grounding_chunks=[SimpleNamespace(web=SimpleNamespace(
+                        domain="example.com",
+                        title="Unofficial summary",
+                        uri="https://example.com/npc-circular",
+                    ))],
+                    grounding_supports=[SimpleNamespace(
+                        grounding_chunk_indices=[0],
+                    )],
+                )
+            )]
+        )
+
+        self.assertEqual(
+            GeminiService._extract_official_grounding_sources(response),
+            [],
+        )
 
 
 if __name__ == "__main__":

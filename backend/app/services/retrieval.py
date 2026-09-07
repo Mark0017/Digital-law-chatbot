@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import re
 import ssl
 import time
@@ -20,12 +21,14 @@ _official_text_locks: dict[str, asyncio.Lock] = {}
 _knowledge_base_cache: tuple[float, bool] | None = None
 _knowledge_base_lock = asyncio.Lock()
 _KNOWLEDGE_BASE_CACHE_SECONDS = 30
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class RetrievalResult:
     context: str
     sources: list[Source]
+    answer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,17 @@ class RetrievalService:
         self.supabase = supabase
 
     async def retrieve(self, question: str) -> RetrievalResult:
+        if self._is_latest_npc_circular_question(question):
+            latest_circular = await self._retrieve_latest_npc_circular()
+            if latest_circular.context:
+                return latest_circular
+
+        web_search_attempted = self._requires_current_web_search(question)
+        if web_search_attempted:
+            web_result = await self._search_official_web(question)
+            if web_result.context:
+                return web_result
+
         explicit_numbers = self._extract_ra_numbers(question)
         chunks: list[dict] = []
         try:
@@ -109,7 +123,9 @@ class RetrievalService:
                 source for source in dynamic_sources if source is not None
             )
         if not official_sources:
-            return RetrievalResult(context="", sources=[])
+            if web_search_attempted:
+                return RetrievalResult(context="", sources=[])
+            return await self._search_official_web(question)
 
         source_texts = await asyncio.gather(
             *(self._get_official_source_text(source) for source in official_sources)
@@ -126,7 +142,104 @@ class RetrievalService:
             )
             sources.append(Source(title=source.title, url=source.url))
 
-        return RetrievalResult(context="\n\n".join(context_parts), sources=sources)
+        result = RetrievalResult(context="\n\n".join(context_parts), sources=sources)
+        if result.context:
+            return result
+        if web_search_attempted:
+            return result
+        return await self._search_official_web(question)
+
+    async def _search_official_web(self, question: str) -> RetrievalResult:
+        if not getattr(self.settings, "web_search_enabled", True):
+            return RetrievalResult(context="", sources=[])
+        search = getattr(self.gemini, "search_official_web", None)
+        if search is None:
+            return RetrievalResult(context="", sources=[])
+        try:
+            context, sources = await search(question)
+        except Exception as exc:
+            logger.warning("Official web fallback failed: %s", type(exc).__name__)
+            return RetrievalResult(context="", sources=[])
+        return RetrievalResult(context=context, sources=sources)
+
+    async def _retrieve_latest_npc_circular(self) -> RetrievalResult:
+        source = next(
+            source
+            for source in self._official_sources()
+            if source.source_type == "NPC_ISSUANCES"
+        )
+        source_text = await self._get_official_source_text(source)
+        circular = self._parse_latest_npc_circular(source_text)
+        if circular is None:
+            return RetrievalResult(context="", sources=[])
+
+        identifier, title, url = circular
+        citation = Source(title=f"{identifier} - {title}", url=url)
+        answer = (
+            "The latest circular listed by the National Privacy Commission is "
+            f"**{identifier} - {title}** [1]."
+        )
+        context = (
+            "The National Privacy Commission's current circular index lists "
+            f"{identifier}, titled {title}, as its latest circular."
+        )
+        return RetrievalResult(context=context, sources=[citation], answer=answer)
+
+    @staticmethod
+    def _parse_latest_npc_circular(
+        page_text: str,
+    ) -> tuple[str, str, str] | None:
+        circulars_heading = re.search(r"(?im)^#{0,6}\s*CIRCULARS\s*$", page_text)
+        if circulars_heading is None:
+            return None
+        circulars_text = page_text[circulars_heading.end():]
+        pattern = re.compile(
+            r"NPC\s+Circular(?:\s+No\.)?\s+(\d{4})\s*-\s*(\d{1,3})"
+            r"\s*-?\s*\**\s*\[([^\]]+)\]\((https?://[^)]+)\)",
+            re.IGNORECASE,
+        )
+        candidates: list[tuple[int, int, str, str]] = []
+        for match in pattern.finditer(circulars_text):
+            year = int(match.group(1))
+            number = int(match.group(2))
+            title = " ".join(match.group(3).split())
+            url = match.group(4).strip()
+            parsed_url = urlparse(url)
+            if (
+                parsed_url.scheme != "https"
+                or parsed_url.hostname not in {"privacy.gov.ph", "www.privacy.gov.ph"}
+                or not parsed_url.path.startswith("/wp-content/uploads/")
+            ):
+                continue
+            candidates.append((year, number, title, url))
+        if not candidates:
+            return None
+
+        year, number, title, url = max(candidates, key=lambda item: item[:2])
+        return f"NPC Circular No. {year}-{number:02d}", title, url
+
+    @staticmethod
+    def _requires_current_web_search(question: str) -> bool:
+        normalized = " ".join(re.findall(r"[a-z0-9]+", question.lower()))
+        freshness_markers = (
+            "latest", "newest", "most recent", "currently", "current",
+            "recently released", "as of today", "this year", "new circular",
+            "new advisory", "new issuance",
+        )
+        return any(marker in normalized for marker in freshness_markers)
+
+    @classmethod
+    def _is_latest_npc_circular_question(cls, question: str) -> bool:
+        normalized = " ".join(re.findall(r"[a-z0-9]+", question.lower()))
+        asks_about_npc = (
+            re.search(r"\bnpc\b", normalized) is not None
+            or "national privacy" in normalized
+        )
+        return (
+            asks_about_npc
+            and "circular" in normalized
+            and cls._requires_current_web_search(normalized)
+        )
 
     async def _resolve_dynamic_source(
         self,
@@ -237,22 +350,78 @@ class RetrievalService:
                     response = await client.get(source.url)
                 response.raise_for_status()
             except httpx.HTTPError:
-                return ""
-
-            soup = BeautifulSoup(response.text, "html.parser")
-            for element in soup(["script", "style", "nav", "footer", "form", "noscript"]):
-                element.decompose()
-            units = [
-                " ".join(line.split())
-                for line in soup.get_text("\n", strip=True).splitlines()
-                if len(" ".join(line.split())) >= 2
-            ]
-            source_text = "\n".join(units)
+                source_text = await self._get_official_text_through_gateway(source)
+                if not source_text:
+                    return ""
+            else:
+                soup = BeautifulSoup(response.text, "html.parser")
+                for element in soup(
+                    ["script", "style", "nav", "footer", "form", "noscript"]
+                ):
+                    element.decompose()
+                units = [
+                    " ".join(line.split())
+                    for line in soup.get_text("\n", strip=True).splitlines()
+                    if len(" ".join(line.split())) >= 2
+                ]
+                source_text = "\n".join(units)
             _official_text_cache[source.url] = source_text
             return source_text
 
+    async def _get_official_text_through_gateway(
+        self,
+        source: OfficialLegalSource,
+    ) -> str:
+        parsed_source_url = urlparse(source.url)
+        hostname = (parsed_source_url.hostname or "").lower()
+        if (
+            parsed_source_url.scheme != "https"
+            or (hostname != "gov.ph" and not hostname.endswith(".gov.ph"))
+        ):
+            return ""
+
+        gateway = getattr(self.settings, "official_text_gateway_url", None)
+        if not gateway:
+            return ""
+        gateway = str(gateway).strip().rstrip("/")
+        if urlparse(gateway).scheme != "https":
+            return ""
+
+        try:
+            async with self._official_http_client() as client:
+                response = await client.get(f"{gateway}/{source.url}")
+            response.raise_for_status()
+        except httpx.HTTPError:
+            return ""
+
+        if len(response.content) > 1_000_000:
+            return ""
+        source_header = re.search(
+            r"(?im)^URL Source:\s*(https?://\S+)\s*$",
+            response.text[:2_000],
+        )
+        if (
+            source_header is None
+            or source_header.group(1).rstrip("/") != source.url.rstrip("/")
+        ):
+            return ""
+        return response.text
+
     def _official_sources(self) -> tuple[OfficialLegalSource, ...]:
         return (
+            OfficialLegalSource(
+                source_type="NPC_ISSUANCES",
+                title="NPC Advisories and Circulars",
+                url=getattr(
+                    self.settings,
+                    "npc_issuances_url",
+                    "https://privacy.gov.ph/pips-and-pics/advisories-circulars/",
+                ),
+                markers=(
+                    "npc circular", "npc advisory", "npc issuance",
+                    "national privacy commission", "privacy commission",
+                ),
+            ),
             OfficialLegalSource(
                 source_type="RA_10173",
                 title="Republic Act No. 10173 - Data Privacy Act of 2012",

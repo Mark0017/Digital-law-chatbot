@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     gemini_fallback_model: str = "gemini-3.7-flash"
     embedding_model: str = "gemini-embedding-2"
     embedding_dimension: int = Field(default=768, ge=128, le=3072)
+    web_search_enabled: bool = True
+    official_text_gateway_url: str | None = "https://r.jina.ai/"
 
     supabase_url: str
     supabase_secret_key: SecretStr
@@ -22,6 +24,9 @@ class Settings(BaseSettings):
     max_upload_bytes: int = Field(default=26_214_400, ge=1_048_576)
 
     npc_dpa_url: str = "https://privacy.gov.ph/data-privacy-act/"
+    npc_issuances_url: str = (
+        "https://privacy.gov.ph/pips-and-pics/advisories-circulars/"
+    )
     judiciary_republic_acts_url: str = (
         "https://elibrary.judiciary.gov.ph/republic_acts"
     )

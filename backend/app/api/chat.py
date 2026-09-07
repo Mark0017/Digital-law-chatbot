@@ -1,4 +1,3 @@
-import asyncio
 import logging
 
 import httpx
@@ -43,16 +42,11 @@ async def chat(
     if not owns_conversation:
         raise HTTPException(status_code=404, detail="Conversation not found.")
 
-    retrieval = RetrievalService(settings, gemini, supabase)
-    scope, result = await asyncio.gather(
-        _classify_scope_safely(gemini, request.message),
-        retrieval.retrieve(request.message),
-    )
+    scope = await _classify_scope_safely(gemini, request.message)
 
     if scope == ScopeClassification.OUT_OF_SCOPE:
         answer = (
-            "I'm designed to answer questions about RA 10173, RA 10175, RA 8792, "
-            "RA 9470, RA 10844, RA 11032, and RA 11930. I can't answer questions "
+             "I can't answer questions "
             "outside these supported Philippine digital laws."
         )
         message_id = await _save_message_safely(
@@ -60,7 +54,12 @@ async def chat(
         )
         return ChatResponse(answer=answer, scope=scope, sources=[], message_id=message_id)
 
-    if not result.context:
+    retrieval = RetrievalService(settings, gemini, supabase)
+    result = await retrieval.retrieve(request.message)
+
+    if result.answer:
+        answer = result.answer
+    elif not result.context:
         answer = (
             "I couldn't find sufficient information in the available official Philippine "
             "legal sources to answer this confidently."

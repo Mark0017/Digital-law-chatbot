@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import app.services.retrieval as retrieval_module
+from app.schemas.chat import Source
 from app.services.retrieval import OfficialLegalSource, RetrievalService
 
 
@@ -59,6 +60,84 @@ The applicable penalties are provided here.
 
 
 class RetrievalOptimizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_latest_npc_circular_does_not_require_gemini(self) -> None:
+        retrieval_module._knowledge_base_cache = None
+        settings = SimpleNamespace(
+            web_search_enabled=True,
+            npc_issuances_url=(
+                "https://privacy.gov.ph/pips-and-pics/advisories-circulars/"
+            ),
+            judiciary_ra_10173_url="https://example.com/ra-10173",
+            judiciary_ra_10175_url="https://example.com/ra-10175",
+            judiciary_ra_8792_url="https://example.com/ra-8792",
+            judiciary_ra_9470_url="https://example.com/ra-9470",
+            judiciary_ra_10844_url="https://example.com/ra-10844",
+            judiciary_ra_11032_url="https://example.com/ra-11032",
+            judiciary_ra_11930_url="https://example.com/ra-11930",
+        )
+        gemini = SimpleNamespace(
+            search_official_web=AsyncMock(),
+            embed_question=AsyncMock(),
+        )
+        supabase = SimpleNamespace(has_ready_documents=AsyncMock())
+        service = RetrievalService(settings, gemini, supabase)
+        service._get_official_source_text = AsyncMock(return_value="""
+# CIRCULARS
+* **NPC Circular No. 2024-02 -**[CCTV Systems](https://privacy.gov.ph/wp-content/uploads/2024/08/cctv.pdf)
+* **NPC Circular No. 2025-01 -**[Guidelines on Body-Worn Cameras](https://privacy.gov.ph/wp-content/uploads/2025/05/bwc.pdf)
+""".strip())
+
+        result = await service.retrieve(
+            "What's the latest NPC circular released by the National Privacy Commission?"
+        )
+
+        gemini.search_official_web.assert_not_awaited()
+        gemini.embed_question.assert_not_awaited()
+        supabase.has_ready_documents.assert_not_awaited()
+        self.assertIn("NPC Circular No. 2025-01", result.context)
+        self.assertIn("NPC Circular No. 2025-01", result.answer)
+        self.assertEqual(
+            str(result.sources[0].url),
+            "https://privacy.gov.ph/wp-content/uploads/2025/05/bwc.pdf",
+        )
+
+    async def test_other_current_questions_use_live_official_web_search(self) -> None:
+        official_source = Source(
+            title="Official government source",
+            url="https://example.gov.ph/current-rule",
+        )
+        settings = SimpleNamespace(web_search_enabled=True)
+        gemini = SimpleNamespace(search_official_web=AsyncMock(return_value=(
+            "Current official-web notes.",
+            [official_source],
+        )))
+        service = RetrievalService(settings, gemini, SimpleNamespace())
+
+        result = await service.retrieve(
+            "What is the latest Philippine cybercrime regulation?"
+        )
+
+        gemini.search_official_web.assert_awaited_once()
+        self.assertEqual(result.sources, [official_source])
+
+    def test_latest_npc_parser_rejects_non_official_document_url(self) -> None:
+        page_text = """
+# CIRCULARS
+* **NPC Circular No. 2099-01 -**[Fake](https://example.com/fake.pdf)
+""".strip()
+
+        self.assertIsNone(
+            RetrievalService._parse_latest_npc_circular(page_text)
+        )
+
+    def test_detects_questions_that_require_current_information(self) -> None:
+        self.assertTrue(RetrievalService._requires_current_web_search(
+            "What is the latest NPC circular?"
+        ))
+        self.assertFalse(RetrievalService._requires_current_web_search(
+            "What rights do data subjects have under RA 10173?"
+        ))
+
     async def test_skips_embedding_when_knowledge_base_is_empty(self) -> None:
         retrieval_module._knowledge_base_cache = None
         settings = SimpleNamespace(
@@ -201,6 +280,28 @@ class RetrievalOptimizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [source.source_type for source in selected],
             ["RA_10173", "RA_10175"],
+        )
+
+    def test_selects_npc_issuance_index_for_circular_questions(self) -> None:
+        settings = SimpleNamespace(
+            judiciary_ra_10173_url="https://example.com/ra-10173",
+            judiciary_ra_10175_url="https://example.com/ra-10175",
+            judiciary_ra_8792_url="https://example.com/ra-8792",
+            judiciary_ra_9470_url="https://example.com/ra-9470",
+            judiciary_ra_10844_url="https://example.com/ra-10844",
+            judiciary_ra_11032_url="https://example.com/ra-11032",
+            judiciary_ra_11930_url="https://example.com/ra-11930",
+        )
+        service = RetrievalService(settings, SimpleNamespace(), SimpleNamespace())
+
+        selected = service._select_official_sources(
+            "Explain NPC Circular 2024-02",
+            service._official_sources(),
+        )
+
+        self.assertEqual(
+            [source.source_type for source in selected],
+            ["NPC_ISSUANCES"],
         )
 
 
